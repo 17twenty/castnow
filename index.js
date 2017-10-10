@@ -7,6 +7,7 @@ var keypress = require('keypress');
 var ui = require('playerui')();
 var circulate = require('array-loop');
 var xtend = require('xtend');
+var shuffle = require('array-shuffle');
 var unformatTime = require('./utils/unformat-time');
 var debug = require('debug')('castnow');
 var debouncedSeeker = require('debounced-seeker');
@@ -14,45 +15,59 @@ var noop = function() {};
 
 // plugins
 var directories = require('./plugins/directories');
+var xspf = require('./plugins/xspf');
 var localfile = require('./plugins/localfile');
 var torrent = require('./plugins/torrent');
-var youtubeplaylist = require('./plugins/youtubeplaylist');
-var youtube = require('./plugins/youtube');
 var transcode = require('./plugins/transcode');
 var subtitles = require('./plugins/subtitles');
+var stdin = require('./plugins/stdin');
 
 if (opts.help) {
   return console.log([
     '',
     'Usage: castnow [<media>, <media>, ...] [OPTIONS]',
     '',
-    'Option                  Meaning',
-    '--tomp4                 Convert file to mp4 while playback',
-    '--device <name>         The name of the chromecast device that should be used',
-    '--address <ip>          The IP address of your chromecast device',
-    '--subtitles <path/url>  Path or URL to an SRT or VTT file',
-    '--myip <ip>             Your main IP address',
-    '--quiet               No output',
-    '--peerflix-* <value>    Pass options to peerflix',
-    '--ffmpeg-* <value>      Pass options to ffmpeg',
-    '--type <val>            Explicity set the mime-type (e.g. "video/mp4")',
-    '--bypass-srt-encoding   Disable automatic UTF8 encoding of SRT subtitles',
-    '--seek <value>          Seek to the specified time on start using the format hh:mm:ss or mm:ss',
+    'Option                   Meaning',
+    '--tomp4                  Convert file to mp4 during playback',
+    '--device <name>          The name of the Chromecast device that should be used',
+    '--address <ip>           The IP address or hostname of your Chromecast device',
+    '--subtitles <path/url>   Path or URL to an SRT or VTT file',
+    '--subtitle-scale <scale> Subtitle font scale',
+    '--subtitle-color <color> Subtitle font RGBA color',
+    '--subtitle-port <port>   Specify the port to be used for serving subtitles',
+    '--myip <ip>              Your local IP address',
+    '--quiet                  No output',
+    '--peerflix-* <value>     Pass options to peerflix',
+    '--ffmpeg-* <value>       Pass options to ffmpeg',
+    '--type <type>            Explicitly set the mime-type (e.g. "video/mp4")',
+    '--bypass-srt-encoding    Disable automatic UTF-8 encoding of SRT subtitles',
+    '--seek <hh:mm:ss>        Seek to the specified time on start using the format hh:mm:ss or mm:ss',
+    '--loop                   Loop over playlist, or file, forever',
+    '--shuffle                Play in random order',
+    '--recursive              List all files in directories recursively',
+    '--volume-step <step>     Step at which the volume changes. Helpful for speakers that are softer or louder than normal. Value ranges from 0 to 1 (e.g. ".05")',
+    '--localfile-port <port>  Specify the port to be used for serving a local file',
+    '--transcode-port <port>  Specify the port to be used for serving a transcoded file',
+    '--torrent-port <port>    Specify the port to be used for serving a torrented file',
+    '--stdin-port <port>      Specify the port to be used for serving a file read from stdin',
+    '--command <key1>,<key2>  Execute key command(s) (where each <key> is one of the keys listed below)',
+    '--exit                   Exit when playback begins or --command completes',
 
-    '--help                  This help screen',
+    '--help                   This help screen',
     '',
     'Player controls',
     '',
-    'Key                     Meaning',
-    'space                   Toggle between play and pause',
-    'm                       Toggle between mute and unmute',
-    'up                      Volume Up',
-    'down                    Volume Down',
-    'left                    Seek backward',
-    'right                   Seek forward',
-    'n                       Next in playlist',
-    's                       Stop playback',
-    'quit                    Quit',
+    'Key                      Action',
+    'space                    Toggle between play and pause',
+    'm                        Toggle mute',
+    't                        Toggle subtitles',
+    'up                       Volume Up',
+    'down                     Volume Down',
+    'left                     Seek backward',
+    'right                    Seek forward',
+    'n                        Next in playlist',
+    's                        Stop playback',
+    'quit                     Quit',
     ''
   ].join('\n'));
 }
@@ -67,11 +82,37 @@ if (opts._.length) {
 
 delete opts._;
 
-if (opts.quiet || process.env.DEBUG) {
+if (opts.quiet || opts.exit || process.env.DEBUG) {
   ui.hide();
 }
 
+var volumeStep = 0.05;
+var stepOption = opts['volume-step'];
+
+if (stepOption) {
+  var parsed = parseFloat(stepOption);
+
+  if (isNaN(parsed)) {
+    fatalError('invalid --volume-step');
+  }
+
+  if (parsed < 0 || parsed > 1) {
+    fatalError('--volume-step must be between 0 and 1');
+  }
+
+  volumeStep = parsed;
+}
+
+debug('volume step: %s', volumeStep);
+
 ui.showLabels('state');
+
+function fatalError(err) {
+  ui.hide(err);
+  debug(err);
+  console.log(chalk.red(err));
+  process.exit();
+}
 
 var last = function(fn, l) {
   return function() {
@@ -92,10 +133,13 @@ var ctrl = function(err, p, ctx) {
 
   var playlist = ctx.options.playlist;
   var volume;
+  var is_keyboard_interactive = process.stdin.isTTY || false;
 
-  keypress(process.stdin);
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
+  if (is_keyboard_interactive) {
+    keypress(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+  }
 
   ctx.once('closed', function() {
     ui.hide();
@@ -115,12 +159,22 @@ var ctrl = function(err, p, ctx) {
     });
   }
 
-  var seek = debouncedSeeker(function(offset) {
+  var seekImmediate = function(offset) {
     if (ctx.options.disableSeek || offset === 0) return;
     var seconds = Math.max(0, (p.getPosition() / 1000) + offset);
     debug('seeking to %s', seconds);
     p.seek(seconds);
-  }, 500);
+  };
+
+  if (opts.exit) {
+    // cannot debounce or seek never executes before we exit
+    var seek = seekImmediate;
+  } else {
+    var seek = debouncedSeeker(function(offset) {
+      // handles seeking offset = seconds
+      seekImmediate(offset);
+    }, 500);
+  }
 
   var updateTitle = function() {
     p.getStatus(function(err, status) {
@@ -162,11 +216,13 @@ var ctrl = function(err, p, ctx) {
       ui.showLabels('state');
       debug('loading next in playlist: %o', playlist[0]);
       p.load(playlist[0], noop);
-      playlist.shift();
+      var file = playlist.shift();
+      if (ctx.options.loop) playlist.push(file)
     });
   };
 
   p.on('status', last(function(status, memo) {
+    if (opts.exit && status.playerState == 'PLAYING') process.exit();
     if (status.playerState !== 'IDLE') return;
     if (status.idleReason !== 'FINISHED') return;
     if (memo && memo.playerState === 'IDLE') return;
@@ -187,8 +243,8 @@ var ctrl = function(err, p, ctx) {
 
     // toggle between mute / unmute
     m: function() {
-      if(!volume) { 
-        return; 
+      if(!volume) {
+        return;
       } else if (volume.muted) {
         p.unmute(function(err, status) {
           if (err) return;
@@ -202,20 +258,49 @@ var ctrl = function(err, p, ctx) {
       }
     },
 
+    t: function() {
+      if (!p.currentSession.media.tracks) { return }
+      var sessionRequestBody = {
+        type: 'EDIT_TRACKS_INFO'
+      }
+      sessionRequestBody.activeTrackIds = p.currentSession.activeTrackIds ? [] : [1];
+      p.sessionRequest(sessionRequestBody);
+    },
+
     // volume up
     up: function() {
-      if (!volume || volume.level >= 1) return;
-      p.setVolume(Math.min(volume.level + 0.05, 1), function(err, status) {
-        if (err) return;
+      if (!volume || volume.level >= 1) {
+        return;
+      }
+
+      var newVolume = Math.min(volume.level + volumeStep, 1);
+
+      p.setVolume(newVolume, function(err, status) {
+        if (err) {
+          return;
+        }
+
+        debug("volume up: %s", status.level);
+
         volume = status;
       });
     },
 
     // volume down
     down: function() {
-      if (!volume || volume.level <= 0) return;
-      p.setVolume(Math.max(volume.level - 0.05, 0), function(err, status) {
-        if (err) return;
+      if (!volume || volume.level <= 0) {
+        return;
+      }
+
+      var newVolume = Math.max(volume.level - volumeStep, 0);
+
+      p.setVolume(newVolume, function(err, status) {
+        if (err) {
+          return;
+        }
+
+        debug("volume down: %s", status.level);
+
         volume = status;
       });
     },
@@ -246,15 +331,41 @@ var ctrl = function(err, p, ctx) {
     }
   };
 
-  process.stdin.on('keypress', function(ch, key) {
-    if (key && key.name && keyMappings[key.name]) {
-      debug('key pressed: %s', key.name);
-      keyMappings[key.name]();
+  if (is_keyboard_interactive) {
+    process.stdin.on('keypress', function(ch, key) {
+      if (key && key.name && keyMappings[key.name]) {
+        debug('key pressed: %s', key.name);
+        keyMappings[key.name]();
+      }
+      if (key && key.ctrl && key.name == 'c') {
+        process.exit();
+      }
+    });
+  }
+
+  if (opts.command) {
+    var commands = opts.command.split(",");
+    commands.forEach(function(command) {
+      if (!keyMappings[command]) {
+        fatalError('invalid --command: ' + command);
+      }
+    });
+
+    var index = 0;
+    function run_commands() {
+      if (index < commands.length) {
+        var command = commands[index++];
+        keyMappings[command]();
+        p.getStatus(run_commands);
+      } else {
+        if (opts.exit) {
+          process.exit();
+        }
+      }
     }
-    if (key && key.ctrl && key.name == 'c') {
-      process.exit();
-    }
-  });
+
+    p.getStatus(run_commands);
+  }
 };
 
 var capitalize = function(str) {
@@ -279,18 +390,21 @@ player.use(function(ctx, next) {
   next();
 });
 
+player.use(stdin);
 player.use(directories);
 player.use(torrent);
+player.use(xspf);
 player.use(localfile);
-player.use(youtubeplaylist);
-player.use(youtube);
 player.use(transcode);
 player.use(subtitles);
 
 player.use(function(ctx, next) {
   if (ctx.mode !== 'launch') return next();
+  if (ctx.options.shuffle)
+    ctx.options.playlist = shuffle(ctx.options.playlist);
   ctx.options = xtend(ctx.options, ctx.options.playlist[0]);
-  ctx.options.playlist.shift();
+  var file = ctx.options.playlist.shift();
+  if (ctx.options.loop) ctx.options.playlist.push(file);
   next();
 });
 
